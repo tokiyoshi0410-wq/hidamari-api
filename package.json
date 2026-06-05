@@ -1,0 +1,9 @@
+{
+  "name": "hidamari-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "duckdb": "^1.1.3"
+  }
+}
