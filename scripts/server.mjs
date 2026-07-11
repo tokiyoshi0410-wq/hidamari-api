@@ -1,8 +1,9 @@
-// ヒダマリ 建物データ API（デモ用・LAN 公開）。
+// ヒダマリ 建物データ API。
 // GET /buildings?lat=&lng=&radius=  →  { center, city, count, buildings:[{id,heightM,footprint:[{lat,lng}]}] }
-// 位置から該当 Flateau 都市を判定し、初回はその都市 parquet をローカルキャッシュ、以後はローカル即時 bbox クエリ。
+// 位置から該当 Flateau 都市を判定し、リモート parquet を httpfs の range リクエストで部分読みする。
+// (旧方式のファイル全体ダウンロードは横浜級 245MB で 512MB 無料枠が OOM し 502 になるため廃止)
 import http from 'node:http';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import duckdb from 'duckdb';
@@ -10,15 +11,15 @@ import duckdb from 'duckdb';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = process.env.DATA_DIR || `${HERE}/..`; // cities-index.json はパッケージ直下（コンテナでも解決）
 const INDEX = `${ROOT}/cities-index.json`;
-const CACHE = process.env.CACHE_DIR || `${ROOT}/.cache`;
 const PORT = process.env.PORT || 8787;
-mkdirSync(CACHE, { recursive: true });
 
 const db = new duckdb.Database(':memory:');
 const con = db.connect();
 const exec = (s) => new Promise((r, j) => con.exec(s, (e) => (e ? j(e) : r())));
 const all = (s) => new Promise((r, j) => con.all(s, (e, x) => (e ? j(e) : r(x))));
 await exec('INSTALL spatial'); await exec('LOAD spatial');
+await exec('INSTALL httpfs'); await exec('LOAD httpfs');
+await exec("SET memory_limit='256MB'"); // 無料枠 512MB の半分で頭打ちにする
 
 function loadIndex() {
   try { return JSON.parse(readFileSync(INDEX, 'utf8')); } catch { return null; }
@@ -30,23 +31,6 @@ function pickCandidates(index, lat, lng) {
     .map((c) => ({ c, d: ((c.minLng + c.maxLng) / 2 - lng) ** 2 + ((c.minLat + c.maxLat) / 2 - lat) ** 2 }))
     .sort((a, b) => a.d - b.d)
     .map((x) => x.c);
-}
-const inflight = new Map(); // code -> Promise<localPath>（同一都市の同時DLを1本化）
-async function ensureCached(city) {
-  const local = `${CACHE}/${city.code}.parquet`;
-  if (existsSync(local)) return local;
-  if (inflight.has(city.code)) return inflight.get(city.code);
-  const p = (async () => {
-    const resp = await fetch(city.url);
-    if (!resp.ok) throw new Error(`download ${city.code} failed: ${resp.status}`);
-    const buf = Buffer.from(await resp.arrayBuffer());
-    const tmp = `${local}.tmp.${process.pid}`;
-    writeFileSync(tmp, buf);
-    renameSync(tmp, local); // 原子的に差し替え（破損キャッシュ防止）
-    return local;
-  })().finally(() => inflight.delete(city.code));
-  inflight.set(city.code, p);
-  return p;
 }
 function exteriorRing(geojson) {
   const g = JSON.parse(geojson);
@@ -73,10 +57,9 @@ http.createServer(async (req, res) => {
   try {
     let used = candidates[0], buildings = [];
     for (const city of candidates.slice(0, 4)) {
-      const local = await ensureCached(city);
       const rows = await all(
         `SELECT CAST(gml_id AS VARCHAR) AS id, measured_height AS h, ST_AsGeoJSON(GEOM) AS gj
-         FROM read_parquet('${local.replace(/'/g, "''")}')
+         FROM read_parquet('${city.url.replace(/'/g, "''")}')
          WHERE measured_height >= 5
            AND cal_xmax >= ${lng - dLng} AND cal_xmin <= ${lng + dLng}
            AND cal_ymax >= ${lat - dLat} AND cal_ymin <= ${lat + dLat}
