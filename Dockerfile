@@ -1,5 +1,5 @@
 # ヒダマリ 建物データ API（Render / Cloud Run / Fly 用）。HTTPS はプラットフォームが終端。
-FROM node:20-slim
+FROM node:22-slim
 WORKDIR /app
 COPY package.json package.json
 RUN npm install --omit=dev
